@@ -42,18 +42,20 @@ struct sqliterk_notify {
                          sqliterk_table *table,
                          sqliterk_column *column);
     void (*onEndParseTable)(sqliterk *rk, sqliterk_table *table);
+    void (*didParsePage)(sqliterk *rk, int pageno);
 };
 int sqliterk_register_notify(sqliterk *rk, sqliterk_notify notify);
 
 typedef struct sqliterk_cipher_conf {
     const void *key;
     int key_len;
-    const char *cipher_name;
     int page_size;
     int kdf_iter;
     int use_hmac;
     const unsigned char *kdf_salt;
 } sqliterk_cipher_conf;
+    
+void sqliterk_cipher_conf_set_key(sqliterk_cipher_conf *conf, const void* key, int key_len);
 
 typedef struct sqlite3 sqlite3;
 typedef struct sqliterk_master_info sqliterk_master_info;
@@ -76,6 +78,16 @@ int sqliterk_output(sqliterk *rk,
                     sqlite3 *db,
                     sqliterk_master_info *master,
                     unsigned int flags);
+int sqliterk_output_cb(sqliterk *rk,
+                       sqlite3 *db,
+                       sqliterk_master_info *master,
+                       unsigned int flags,
+                       int (*callback)(void *user,
+                                       sqliterk *rk,
+                                       sqliterk_table *table,
+                                       sqliterk_column *column),
+                       void *user);
+void sqliterk_cancel(sqliterk *rk);
 int sqliterk_make_master(const char **tables,
                          int num_tables,
                          sqliterk_master_info **out_master);
@@ -164,6 +176,8 @@ int sqliterk_register(sqliterk_os os);
 #define SQLITERK_SHORT_READ 5
 #define SQLITERK_DAMAGED 6
 #define SQLITERK_DISCARD 7
+#define SQLITERK_CANCELLED 8
+#define SQLITERK_IGNORE 100
 const char *sqliterk_description(int result);
 
 #ifndef SQLITRK_CONFIG_DEFAULT_PAGESIZE

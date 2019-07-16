@@ -16,9 +16,8 @@
 
 package com.tencent.wcdb.database;
 
+import android.os.Environment;
 import android.os.StatFs;
-
-import java.lang.reflect.Method;
 
 /**
  * Provides access to SQLite functions that affect all database connection,
@@ -36,7 +35,9 @@ import java.lang.reflect.Method;
  */
 public final class SQLiteGlobal {
     private static final String TAG = "WCDB.SQLiteGlobal";
+
     private static native int nativeReleaseMemory();
+    private static native void nativeSetDefaultCipherSettings(int pageSize);
 
     /** Default page size to use when creating a database. */
     public static final int defaultPageSize;
@@ -60,20 +61,26 @@ public final class SQLiteGlobal {
     public static final int walConnectionPoolSize = 4;
 
     static {
-        try {
-            Class<?> cls = Class.forName("android.os.SystemProperties");
-            Method getSystemIntMethod = cls.getMethod("getInt", String.class, int.class);
-
-            int pageSize = new StatFs("/data").getBlockSize();
-            defaultPageSize = (Integer) getSystemIntMethod.invoke(null, "debug.sqlite.pagesize", pageSize);
-        } catch (Exception e) {
-            // Reflection failed, this should not happen.
-            throw new NoClassDefFoundError();
+        // Test if libwcdb.so is already loaded in other routines.
+        if (!WCDBInitializationProbe.libLoaded) {
+            System.loadLibrary("wcdb");
         }
-    }
 
-    private SQLiteGlobal() {
+        int pageSize;
+        try {
+            String dataPath = Environment.getDataDirectory().getAbsolutePath();
+            pageSize = new StatFs(dataPath).getBlockSize();
+        } catch (RuntimeException e) {
+            pageSize = 4096;
+        }
+        defaultPageSize = pageSize;
+        nativeSetDefaultCipherSettings(pageSize);
     }
+    // Dummy static method to trigger class initialization.
+    // See [JLS 12.4.1](http://docs.oracle.com/javase/specs/jls/se7/html/jls-12.html#jls-12.4.1)
+    public static void loadLib() {}
+
+    private SQLiteGlobal() {}
 
     /**
      * Attempts to release memory by pruning the SQLite page cache and other
@@ -85,4 +92,14 @@ public final class SQLiteGlobal {
         return nativeReleaseMemory();
     }
 
+}
+
+/**
+ * Probe class to detect whether "libwcdb.so" is loaded.
+ * It's set to true in JNI initialization routine.
+ */
+class WCDBInitializationProbe {
+    static boolean libLoaded = false;
+    static volatile long apiEnv = 0L;
+    private WCDBInitializationProbe() {}
 }

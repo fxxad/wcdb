@@ -22,26 +22,29 @@
 #include "Logger.h"
 #include "ModuleLoader.h"
 #include <jni.h>
-#include <repair/SQLiteRepairKit.h>
+#include <SQLiteRepairKit.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 static int g_error_result = 0;
 static char g_error_msg[2048] = {0};
 
 namespace wcdb {
+
+static jmethodID sMID_onProgress = nullptr;
+
 static sqliterk_cipher_conf *parseCipherSpec(JNIEnv *env, jobject cipherSpec)
 {
-    sqliterk_cipher_conf *result = NULL;
-    jfieldID fidCipher;
+    sqliterk_cipher_conf *result = nullptr;
     jfieldID fidKdfIteration;
     jfieldID fidHmacEnabled;
     jfieldID fidPageSize;
-    jstring cipherStr;
-    const char *cipher;
-    int cipher_len;
 
     if (!cipherSpec) {
         result = (sqliterk_cipher_conf *) malloc(sizeof(sqliterk_cipher_conf));
+        if (!result) return nullptr;
+
         memset(result, 0, sizeof(sqliterk_cipher_conf));
         result->use_hmac = -1;
         return result;
@@ -52,9 +55,6 @@ static sqliterk_cipher_conf *parseCipherSpec(JNIEnv *env, jobject cipherSpec)
     if (!clsCipherSpec)
         goto bail;
 
-    fidCipher = env->GetFieldID(clsCipherSpec, "cipher", "Ljava/lang/String;");
-    if (!fidCipher)
-        goto bail;
     fidKdfIteration = env->GetFieldID(clsCipherSpec, "kdfIteration", "I");
     if (!fidKdfIteration)
         goto bail;
@@ -65,22 +65,9 @@ static sqliterk_cipher_conf *parseCipherSpec(JNIEnv *env, jobject cipherSpec)
     if (!fidPageSize)
         goto bail;
 
-    cipher = NULL;
-    cipher_len = 0;
-    cipherStr = (jstring) env->GetObjectField(cipherSpec, fidCipher);
-    if (cipherStr) {
-        cipher_len = env->GetStringUTFLength(cipherStr) + 1;
-        cipher = env->GetStringUTFChars(cipherStr, NULL);
-    }
-
-    result = (sqliterk_cipher_conf *) malloc(sizeof(sqliterk_cipher_conf) +
-                                             cipher_len);
-    if (cipher) {
-        result->cipher_name = (const char *) &result[1];
-        strlcpy((char *) result->cipher_name, cipher, cipher_len + 1);
-        env->ReleaseStringUTFChars(cipherStr, cipher);
-    } else
-        result->cipher_name = NULL;
+    result = (sqliterk_cipher_conf *) malloc(sizeof(sqliterk_cipher_conf));
+    if (!result) return nullptr;
+    memset(result, 0, sizeof(sqliterk_cipher_conf));
 
     result->page_size = env->GetIntField(cipherSpec, fidPageSize);
     result->kdf_iter = env->GetIntField(cipherSpec, fidKdfIteration);
@@ -90,7 +77,7 @@ static sqliterk_cipher_conf *parseCipherSpec(JNIEnv *env, jobject cipherSpec)
 
 bail:
     free(result);
-    return NULL;
+    return nullptr;
 }
 
 static JNICALL jlong nativeInit(JNIEnv *env,
@@ -101,7 +88,7 @@ static JNICALL jlong nativeInit(JNIEnv *env,
                                 jbyteArray saltArr)
 {
 
-    sqliterk *rk = NULL;
+    sqliterk *rk = nullptr;
     sqliterk_cipher_conf *conf = parseCipherSpec(env, cipherSpec);
     if (!conf)
         return 0;
@@ -124,9 +111,11 @@ static JNICALL jlong nativeInit(JNIEnv *env,
 
         conf->kdf_salt = (unsigned char *) alloca(16);
         env->GetByteArrayRegion(saltArr, 0, 16, (jbyte *) conf->kdf_salt);
+    } else {
+        conf->kdf_salt = nullptr;
     }
 
-    const char *path = env->GetStringUTFChars(pathStr, NULL);
+    const char *path = env->GetStringUTFChars(pathStr, nullptr);
     int rc = sqliterk_open(path, conf, &rk);
     env->ReleaseStringUTFChars(pathStr, path);
 
@@ -140,8 +129,43 @@ static JNICALL void nativeFini(JNIEnv *env, jclass cls, jlong rkPtr)
     sqliterk_close(rk);
 }
 
-static JNICALL jboolean nativeOutput(JNIEnv *env,
-                                     jclass cls,
+struct callback_data {
+    JNIEnv *env;
+    jobject obj;
+    jstring last_table;
+    int last_root;
+};
+
+static int output_callback(void *user, sqliterk *rk, sqliterk_table *table, sqliterk_column *column)
+{
+    callback_data *d = (callback_data *) user;
+    const char *table_name = sqliterk_table_name(table);
+    int root = sqliterk_table_root(table);
+
+    if (d->last_root != root) {
+        if (d->last_table)
+            d->env->DeleteLocalRef(d->last_table);
+        
+        d->last_table = d->env->NewStringUTF(table_name);
+        d->last_root = root;
+    }
+
+    jint result = d->env->CallIntMethod(d->obj, sMID_onProgress, d->last_table,
+        root, (jlong) (intptr_t) column);
+
+    switch (result) {
+        case 0: // RESULT_OK
+            return SQLITERK_OK;
+        case 1: // RESULT_CANCELLED
+            return SQLITERK_CANCELLED;
+        case 2: // RESULT_IGNORE
+            return SQLITERK_IGNORE;
+    }
+    return SQLITERK_MISUSE;
+}
+
+static JNICALL jint nativeOutput(JNIEnv *env,
+                                     jobject obj,
                                      jlong rkPtr,
                                      jlong dbPtr,
                                      jlong masterPtr,
@@ -152,8 +176,22 @@ static JNICALL jboolean nativeOutput(JNIEnv *env,
     sqliterk_master_info *master =
         (sqliterk_master_info *) (intptr_t) masterPtr;
 
-    int rc = sqliterk_output(rk, db, master, flags);
-    return (rc == SQLITERK_OK) ? JNI_TRUE : JNI_FALSE;
+    callback_data data;
+    data.env = env;
+    data.obj = obj;
+    data.last_table = nullptr;
+    data.last_root = 0;
+    
+    int rc = sqliterk_output_cb(rk, db, master, flags, output_callback, &data);
+    if (rc == SQLITERK_OK) return 0;
+    if (rc == SQLITERK_CANCELLED) return 1;
+    return -1;
+}
+
+static JNICALL void nativeCancel(JNIEnv *env, jclass cls, jlong rkPtr)
+{
+    sqliterk *rk = (sqliterk *) (intptr_t) rkPtr;
+    sqliterk_cancel(rk);
 }
 
 static JNICALL jint nativeIntegrityFlags(JNIEnv *env, jclass cls, jlong rkPtr)
@@ -177,11 +215,11 @@ static JNICALL jlong nativeMakeMaster(JNIEnv *env,
 
     for (int i = 0; i < num_tables; i++) {
         jstring str = (jstring) env->GetObjectArrayElement(tableArr, i);
-        tables[i] = env->GetStringUTFChars(str, NULL);
+        tables[i] = env->GetStringUTFChars(str, nullptr);
         env->DeleteLocalRef(str);
     }
 
-    sqliterk_master_info *master = NULL;
+    sqliterk_master_info *master = nullptr;
     int rc = sqliterk_make_master(tables, num_tables, &master);
 
     for (int i = 0; i < num_tables; i++) {
@@ -200,7 +238,7 @@ static JNICALL jboolean nativeSaveMaster(
     sqlite3 *db = (sqlite3 *) (intptr_t) dbPtr;
 
     int key_len = 0;
-    jbyte *key = NULL;
+    jbyte *key = nullptr;
     if (keyArr) {
         key_len = env->GetArrayLength(keyArr);
         if (key_len > 4096)
@@ -210,7 +248,7 @@ static JNICALL jboolean nativeSaveMaster(
         env->GetByteArrayRegion(keyArr, 0, key_len, key);
     }
 
-    const char *path = env->GetStringUTFChars(pathStr, NULL);
+    const char *path = env->GetStringUTFChars(pathStr, nullptr);
     int rc = sqliterk_save_master(db, path, key, key_len);
     env->ReleaseStringUTFChars(pathStr, path);
 
@@ -225,30 +263,30 @@ static JNICALL jlong nativeLoadMaster(JNIEnv *env,
                                       jbyteArray outSaltArr)
 {
     // Path is guaranteed to be non-null by the Java part.
-    const char *path = env->GetStringUTFChars(pathStr, NULL);
+    const char *path = env->GetStringUTFChars(pathStr, nullptr);
 
     int key_len = 0;
-    jbyte *key = NULL;
+    jbyte *key = nullptr;
     if (keyArr) {
         key_len = env->GetArrayLength(keyArr);
-        key = env->GetByteArrayElements(keyArr, NULL);
+        key = env->GetByteArrayElements(keyArr, nullptr);
     }
 
     int num_tables = 0;
-    const char **tables = NULL;
+    const char **tables = nullptr;
     if (tableArr) {
         num_tables = env->GetArrayLength(tableArr);
         tables = (const char **) malloc(sizeof(const char *) * num_tables);
 
         for (int i = 0; i < num_tables; i++) {
             jstring str = (jstring) env->GetObjectArrayElement(tableArr, i);
-            tables[i] = env->GetStringUTFChars(str, NULL);
+            tables[i] = env->GetStringUTFChars(str, nullptr);
             env->DeleteLocalRef(str);
         }
     }
 
     unsigned char salt[16];
-    sqliterk_master_info *master = NULL;
+    sqliterk_master_info *master = nullptr;
     int rc = sqliterk_load_master(path, key, key_len, tables, num_tables,
                                   &master, salt);
 
@@ -284,12 +322,56 @@ static JNICALL void nativeFreeMaster(JNIEnv *env, jclass cls, jlong masterPtr)
     sqliterk_free_master(master);
 }
 
-static const JNINativeMethod sMethods[] = {
+static JNICALL jint cursorNativeGetColumnCount(JNIEnv *env, jclass, jlong ptr)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+    return sqliterk_column_count(column);
+}
+
+static JNICALL jint cursorNativeGetType(JNIEnv *env, jclass, jlong ptr, jint idx)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+    return sqliterk_column_type(column, idx);
+}
+
+static JNICALL jlong cursorNativeGetLong(JNIEnv *env, jclass, jlong ptr, jint idx)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+    return sqliterk_column_integer64(column, idx);
+}
+
+static JNICALL double cursorNativeGetDouble(JNIEnv *env, jclass, jlong ptr, jint idx)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+    return sqliterk_column_number(column, idx);
+}
+
+static JNICALL jstring cursorNativeGetString(JNIEnv *env, jclass, jlong ptr, jint idx)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+
+    // TODO: handle UTF-8 => UTF-16 convertion
+    const char *result = sqliterk_column_text(column, idx);
+    return env->NewStringUTF(result);
+}
+
+static JNICALL jbyteArray cursorNativeGetBlob(JNIEnv *env, jclass, jlong ptr, jint idx)
+{
+    sqliterk_column *column = (sqliterk_column *) (intptr_t) ptr;
+    const void *arr = sqliterk_column_binary(column, idx);
+    int size = sqliterk_column_bytes(column, idx);
+    jbyteArray result = env->NewByteArray(size);
+    env->SetByteArrayRegion(result, 0, size, (const jbyte *) arr);
+    return result;
+}
+
+static const JNINativeMethod sRepairMethods[] = {
     {"nativeInit",
      "(Ljava/lang/String;[BLcom/tencent/wcdb/database/SQLiteCipherSpec;[B)J",
      (void *) nativeInit},
     {"nativeFini", "(J)V", (void *) nativeFini},
-    {"nativeOutput", "(JJJI)Z", (void *) nativeOutput},
+    {"nativeOutput", "(JJJI)I", (void *) nativeOutput},
+    {"nativeCancel", "(J)V", (void *) nativeCancel},
     {"nativeIntegrityFlags", "(J)I", (void *) nativeIntegrityFlags},
     {"nativeLastError", "()Ljava/lang/String;", (void *) nativeLastError},
     {"nativeMakeMaster", "([Ljava/lang/String;)J", (void *) nativeMakeMaster},
@@ -297,6 +379,15 @@ static const JNINativeMethod sMethods[] = {
     {"nativeLoadMaster", "(Ljava/lang/String;[B[Ljava/lang/String;[B)J",
      (void *) nativeLoadMaster},
     {"nativeFreeMaster", "(J)V", (void *) nativeFreeMaster},
+};
+
+static const JNINativeMethod sCursorMethods[] = {
+    {"nativeGetColumnCount", "(J)I", (void *) cursorNativeGetColumnCount},
+    {"nativeGetType", "(JI)I", (void *) cursorNativeGetType},
+    {"nativeGetLong", "(JI)J", (void *) cursorNativeGetLong},
+    {"nativeGetDouble", "(JI)D", (void *) cursorNativeGetDouble},
+    {"nativeGetString", "(JI)Ljava/lang/String;", (void *) cursorNativeGetString},
+    {"nativeGetBlob", "(JI)[B", (void *) cursorNativeGetBlob},
 };
 
 static void xlog(sqliterk_loglevel level, int result, const char *msg)
@@ -328,11 +419,35 @@ static void xlog(sqliterk_loglevel level, int result, const char *msg)
 
 static int register_wcdb_repair(JavaVM *vm, JNIEnv *env)
 {
+    char msg[256];
     sqliterk_os os = {xlog};
     sqliterk_register(os);
 
-    jniRegisterNativeMethods(env, "com/tencent/wcdb/repair/RepairKit", sMethods,
-                             NELEM(sMethods));
+    jclass cls = env->FindClass("com/tencent/wcdb/repair/RepairKit");
+    if (!cls) {
+        snprintf(msg, sizeof(msg),
+                 "Unable to find class '%s', aborting",
+                 "com/tencent/wcdb/repair/RepairKit");
+        env->FatalError(msg);
+    }
+    
+    sMID_onProgress = env->GetMethodID(cls, "onProgress", "(Ljava/lang/String;IJ)I");
+    if (!sMID_onProgress) {
+        snprintf(msg, sizeof(msg),
+                 "Unable to find method '%s' with signature '%s', aborting",
+                 "onProgress", "(Ljava/lang/String;IJ)I");
+        env->FatalError(msg);
+    }
+
+    if (env->RegisterNatives(cls, sRepairMethods, NELEM(sRepairMethods)) < 0) {
+        snprintf(msg, sizeof(msg), "RegisterNatives failed for '%s', aborting",
+                 "com/tencent/wcdb/repair/RepairKit");
+        env->FatalError(msg);
+    }
+    env->DeleteLocalRef(cls);
+
+    jniRegisterNativeMethods(env, "com/tencent/wcdb/repair/RepairKit$RepairCursor", 
+                             sCursorMethods, NELEM(sCursorMethods));
 
     return 0;
 }
